@@ -416,7 +416,7 @@ impl<'r> ResponseBuilder<'r> {
     /// ```
     #[inline(always)]
     pub fn raw_body<T>(&mut self, body: Body<T>) -> &mut ResponseBuilder<'r>
-        where T: AsyncRead + Send + Unpin + 'r
+        where T: AsyncRead + Send + 'r
     {
         self.response.set_raw_body(body);
         self
@@ -882,7 +882,7 @@ impl<'r> Response<'r> {
     /// # })
     /// ```
     #[inline(always)]
-    pub fn body(&mut self) -> Option<Body<&mut (dyn AsyncRead + Unpin + Send)>> {
+    pub fn body(&mut self) -> Option<Body<&mut (dyn AsyncRead + Send)>> {
         // Looks crazy, right? Needed so Rust infers lifetime correctly. Weird.
         match self.body.as_mut() {
             Some(body) => Some(match body.as_mut() {
@@ -1088,7 +1088,7 @@ impl<'r> Response<'r> {
     /// ```
     #[inline(always)]
     pub fn set_raw_body<T>(&mut self, body: Body<T>)
-            where T: AsyncRead + Send + Unpin + 'r {
+            where T: AsyncRead + Send + 'r {
         self.body = Some(match body {
             Body::Sized(b, n) => Body::Sized(Box::pin(b.take(n)), n),
             Body::Chunked(b, n) => Body::Chunked(Box::pin(b), n),

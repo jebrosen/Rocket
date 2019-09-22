@@ -33,10 +33,11 @@ mod head_handling_tests {
         routes![index, empty, other]
     }
 
-    async fn assert_empty_sized_body<T: AsyncRead + Unpin>(body: Body<T>, expected_size: u64) {
+    async fn assert_empty_sized_body(body: Body<&mut (dyn AsyncRead + Send)>, expected_size: u64) {
         match body {
-            Body::Sized(mut body, size) => {
+            Body::Sized(body, size) => {
                 let mut buffer = vec![];
+                let mut body = unsafe { std::pin::Pin::new_unchecked(&mut *body) };
                 body.read_to_end(&mut buffer).await.unwrap();
                 assert_eq!(size, expected_size);
                 assert_eq!(buffer.len(), 0);

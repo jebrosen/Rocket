@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::convert::{From, TryInto};
+use std::convert::From;
 use std::cmp::min;
 use std::io;
 use std::mem;
 use std::sync::Arc;
 
 use futures::future::{Future, FutureExt, BoxFuture};
-use futures::stream::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use yansi::Paint;
@@ -16,18 +15,17 @@ use crate::{logger, handler};
 use crate::config::{self, Config, LoggedValue};
 use crate::request::{Request, FormItems};
 use crate::data::Data;
-use crate::response::{Body, Response};
+use crate::response::Response;
 use crate::router::{Router, Route};
 use crate::catcher::{self, Catcher};
 use crate::outcome::Outcome;
 use crate::error::{LaunchError, LaunchErrorKind};
 use crate::fairing::{Fairing, Fairings};
-use crate::ext::AsyncReadExt;
 use crate::shutdown::{ShutdownHandle, ShutdownHandleManaged};
 
 use crate::http::{Method, Status, Header};
 use crate::http::private::{Listener, Connection, Incoming};
-use crate::http::hyper::{self, header};
+use crate::http::hyper;
 use crate::http::uri::Origin;
 
 /// The main `Rocket` type: used to mount routes and catchers and launch the
@@ -68,112 +66,55 @@ fn hyper_service_fn(
     rocket: Arc<Manifest>,
     h_addr: std::net::SocketAddr,
     hyp_req: hyper::Request<hyper::Body>,
-) -> impl Future<Output = Result<hyper::Response<hyper::Body>, io::Error>> {
-    // This future must return a hyper::Response, but that's not easy
-    // because the response body might borrow from the request. Instead,
-    // we do the body writing in another future that will send us
-    // the response metadata (and a body channel) beforehand.
-    let (tx, rx) = oneshot::channel();
+) -> impl Future<Output = Result<hyper::Response<crate::req_res_pair::PayloadKind>, io::Error>> {
+    async move {
+        let mut pair = crate::req_res_pair::ReqResPair::new(rocket);
 
-    tokio::spawn(async move {
         // Get all of the information from Hyper.
         let (h_parts, h_body) = hyp_req.into_parts();
 
-        // Convert the Hyper request into a Rocket request.
-        let req_res = Request::from_hyp(&rocket, h_parts.method, h_parts.headers, &h_parts.uri, h_addr);
-        let mut req = match req_res {
-            Ok(req) => req,
+        let req_res = pair.try_set_request(move |rocket| {
+            // Convert the Hyper request into a Rocket request.
+            Request::from_hyp(&rocket, h_parts.method, h_parts.headers, h_parts.uri, h_addr)
+        });
+
+        match req_res {
+            Ok(()) => {
+                // Retrieve the data from the hyper body.
+                let data = Data::from_hyp(h_body).await;
+
+                pair.set_response(move |rocket, req|
+                    // Dispatch the request to get a response, then write that response out.
+                    rocket.dispatch(req, data)
+                ).await;
+            },
             Err(e) => {
                 error!("Bad incoming request: {}", e);
                 // TODO: We don't have a request to pass in, so we just
                 // fabricate one. This is weird. We should let the user know
                 // that we failed to parse a request (by invoking some special
                 // handler) instead of doing this.
-                let dummy = Request::new(&rocket, Method::Get, Origin::dummy());
-                let r = rocket.handle_error(Status::BadRequest, &dummy).await;
-                return rocket.issue_response(r, tx).await;
+                pair.try_set_request(|rocket| {
+                    let dummy = Request::new(&rocket, Method::Get, Origin::dummy());
+                    Ok::<_, ()>(dummy)
+                }).expect("dummy is always Ok");
+
+                pair.set_response(move |rocket, dummy|
+                    rocket.handle_error(Status::BadRequest, dummy)
+                ).await;
             }
         };
 
-        // Retrieve the data from the hyper body.
-        let data = Data::from_hyp(h_body).await;
-
-        // Dispatch the request to get a response, then write that response out.
-        let r = rocket.dispatch(&mut req, data).await;
-        rocket.issue_response(r, tx).await;
-    });
-
-    async move {
-        rx.await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
-}
-
-impl Manifest {
-    #[inline]
-    async fn issue_response(
-        &self,
-        response: Response<'_>,
-        tx: oneshot::Sender<hyper::Response<hyper::Body>>,
-    ) {
-        let result = self.write_response(response, tx);
-        match result.await {
-            Ok(()) => {
+        match pair.into_hyper_response() {
+            Ok(res) => {
                 info_!("{}", Paint::green("Response succeeded."));
+                Ok(res)
             }
             Err(e) => {
                 error_!("Failed to write response: {:?}.", e);
+                Err(e)
             }
         }
-    }
-
-    #[inline]
-    async fn write_response(
-        &self,
-        mut response: Response<'_>,
-        tx: oneshot::Sender<hyper::Response<hyper::Body>>,
-    ) -> io::Result<()> {
-        let mut hyp_res = hyper::Response::builder()
-            .status(response.status().code);
-
-        for header in response.headers().iter() {
-            let name = header.name.as_str();
-            let value = header.value.as_bytes();
-            hyp_res = hyp_res.header(name, value);
-        }
-
-        let send_response = move |hyp_res: hyper::ResponseBuilder, body| -> io::Result<()> {
-            let response = hyp_res.body(body).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            tx.send(response).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Client disconnected before the response was started"))
-        };
-
-        match response.body() {
-            None => {
-                hyp_res = hyp_res.header(header::CONTENT_LENGTH, "0");
-                send_response(hyp_res, hyper::Body::empty())?;
-            }
-            Some(body) => {
-                let (body, chunk_size) = match body {
-                    Body::Chunked(body, chunk_size) => {
-                        (body, chunk_size.try_into().expect("u64 -> usize overflow"))
-                    }
-                    Body::Sized(body, size) => {
-                        hyp_res = hyp_res.header(header::CONTENT_LENGTH, size.to_string());
-                        (body, 4096usize)
-                    }
-                };
-
-                let (mut sender, hyp_body) = hyper::Body::channel();
-                send_response(hyp_res, hyp_body)?;
-
-                let mut stream = body.into_bytes_stream(chunk_size);
-
-                while let Some(next) = stream.next().await {
-                    sender.send_data(next?).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                }
-            }
-        };
-
-        Ok(())
     }
 }
 
@@ -183,7 +124,7 @@ impl Manifest {
     ///   * Rewriting the method in the request if _method form field exists.
     ///
     /// Keep this in-sync with derive_form when preprocessing form fields.
-    fn preprocess_request(&self, req: &mut Request<'_>, data: &Data) {
+    fn preprocess_request(req: &mut Request<'_>, data: &Data) {
         // Check if this is a form and if the form contains the special _method
         // field which we use to reinterpret the request's method.
         let data_len = data.peek().len();
@@ -205,16 +146,16 @@ impl Manifest {
     }
 
     #[inline]
-    pub(crate) fn dispatch<'s, 'r: 's>(
-        &'s self,
-        request: &'r mut Request<'s>,
+    pub(crate) fn dispatch<'a: 'fut, 'r: 'fut, 'fut>(
+        &'a self,
+        request: &'r mut Request<'a>,
         data: Data
-    ) -> impl Future<Output = Response<'r>> + 's {
-        async move {
+    ) -> BoxFuture<'fut, Response<'r>> {
+        Box::pin(async move {
             info!("{}:", request);
 
             // Do a bit of preprocessing before routing.
-            self.preprocess_request(request, &data);
+            Self::preprocess_request(request, &data);
 
             // Run the request fairings.
             self.fairings.handle_request(request, &data).await;
@@ -240,16 +181,16 @@ impl Manifest {
             }
 
             response
-        }
+        })
     }
 
     /// Route the request and process the outcome to eventually get a response.
-    fn route_and_process<'s, 'r: 's>(
-        &'s self,
-        request: &'r Request<'s>,
+    fn route_and_process<'a: 'fut, 'r: 'fut, 'fut>(
+        &'a self,
+        request: &'r Request<'a>,
         data: Data
-    ) -> impl Future<Output = Response<'r>> + Send + 's {
-        async move {
+    ) -> BoxFuture<'fut, Response<'r>> {
+        Box::pin(async move {
             match self.route(request, data).await {
                 Outcome::Success(mut response) => {
                     // A user's route responded! Set the cookies.
@@ -275,7 +216,7 @@ impl Manifest {
                 }
                 Outcome::Failure(status) => self.handle_error(status, request).await
             }
-        }
+        })
     }
 
     /// Tries to find a `Responder` for a given `request`. It does this by
@@ -290,12 +231,12 @@ impl Manifest {
     // (ensuring `handler` takes an immutable borrow), any caller to `route`
     // should be able to supply an `&mut` and retain an `&` after the call.
     #[inline]
-    pub(crate) fn route<'s, 'r: 's>(
-        &'s self,
-        request: &'r Request<'s>,
+    pub(crate) fn route<'a: 'fut, 'r: 'fut, 'fut>(
+        &'a self,
+        request: &'r Request<'a>,
         mut data: Data,
-    ) -> impl Future<Output = handler::Outcome<'r>> + 's {
-        async move {
+    ) -> BoxFuture<'fut, handler::Outcome<'r>> {
+        Box::pin(async move {
             // Go through the list of matching routes until we fail or succeed.
             let matches = self.router.route(request);
             for route in matches {
@@ -324,7 +265,7 @@ impl Manifest {
 
             error_!("No matching routes for {}.", request);
             Outcome::Forward(data)
-        }
+        })
     }
 
     // Finds the error catcher for the status `status` and executes it for the
@@ -332,12 +273,12 @@ impl Manifest {
     // catcher is called. If the catcher fails to return a good response, the
     // 500 catcher is executed. If there is no registered catcher for `status`,
     // the default catcher is used.
-    pub(crate) fn handle_error<'s, 'r: 's>(
-        &'s self,
+    pub(crate) fn handle_error<'r>(
+        &'r self,
         status: Status,
-        req: &'r Request<'s>
-    ) -> impl Future<Output = Response<'r>> + 's {
-        async move {
+        req: &'r Request<'_>
+    ) -> BoxFuture<'r, Response<'r>> {
+        Box::pin(async move {
             warn_!("Responding with {} catcher.", Paint::red(&status));
 
             // Try to get the active catcher but fallback to user's 500 catcher.
@@ -362,7 +303,7 @@ impl Manifest {
                     default.handle(req).await.expect("Default 500 response.")
                 }
             }
-        }
+        })
     }
 }
 

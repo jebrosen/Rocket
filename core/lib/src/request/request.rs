@@ -824,12 +824,12 @@ impl<'r> Request<'r> {
         manifest: &'r Manifest,
         h_method: hyper::Method,
         h_headers: hyper::HeaderMap<hyper::HeaderValue>,
-        h_uri: &'r hyper::Uri,
+        h_uri: hyper::Uri,
         h_addr: SocketAddr,
     ) -> Result<Request<'r>, String> {
         // Get a copy of the URI (only supports path-and-query) for later use.
         let uri = match (h_uri.scheme(), h_uri.authority(), h_uri.path_and_query()) {
-            (None, None, Some(paq)) => paq.as_str(),
+            (None, None, Some(paq)) => paq.to_string(),
             _ => return Err(format!("Bad URI: {}", h_uri)),
         };
 
@@ -840,7 +840,7 @@ impl<'r> Request<'r> {
         };
 
         // We need to re-parse the URI since we don't trust Hyper... :(
-        let uri = Origin::parse(uri).map_err(|e| e.to_string())?;
+        let uri = Origin::parse_owned(uri).map_err(|e| e.to_string())?;
 
         // Construct the request object.
         let mut request = Request::new(manifest, method, uri);

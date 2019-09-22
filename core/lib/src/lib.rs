@@ -126,6 +126,7 @@ pub mod http {
     pub use rocket_http::*;
 }
 
+mod req_res_pair;
 mod router;
 mod rocket;
 mod codegen;
