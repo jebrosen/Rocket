@@ -304,7 +304,14 @@ impl Manifest {
                 request.set_route(route);
 
                 // Dispatch the request to the handler.
-                let outcome = route.handler.handle(request, data).await;
+                let outcome = std::panic::AssertUnwindSafe(route.handler.handle(request, data))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        error_!("A request handler panicked.");
+                        warn_!("Handling as a 500 error.");
+                        Outcome::Failure(Status::InternalServerError)
+                    });
 
                 // Check if the request processing completed (Some) or if the request needs
                 // to be forwarded. If it does, continue the loop (None) to try again.
@@ -340,10 +347,16 @@ impl Manifest {
             });
 
             // Dispatch to the user's catcher. If it fails, use the default 500.
-            match catcher.handle(req).await {
-                Ok(r) => return r,
-                Err(err_status) => {
+            match std::panic::AssertUnwindSafe(catcher.handle(req)).catch_unwind().await {
+                Ok(Ok(r)) => return r,
+                Ok(Err(err_status)) => {
                     error_!("Catcher failed with status: {}!", err_status);
+                    warn_!("Using default 500 error catcher.");
+                    let default = self.default_catchers.get(&500).expect("Default 500");
+                    default.handle(req).await.expect("Default 500 response.")
+                }
+                Err(_) => {
+                    error_!("Catcher panicked!");
                     warn_!("Using default 500 error catcher.");
                     let default = self.default_catchers.get(&500).expect("Default 500");
                     default.handle(req).await.expect("Default 500 response.")
