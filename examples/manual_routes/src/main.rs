@@ -11,6 +11,7 @@ use rocket::handler::{Handler, Outcome, HandlerFuture};
 use rocket::catcher::{Catcher, ErrorHandlerFuture};
 use rocket::outcome::{try_outcome, IntoOutcome};
 use rocket::tokio::fs::File;
+use rocket::trace::info;
 
 fn forward<'r>(_req: &'r Request, data: Data) -> HandlerFuture<'r> {
     Box::pin(async move { Outcome::forward(data) })
@@ -41,21 +42,23 @@ fn echo_url<'r>(req: &'r Request, _: Data) -> HandlerFuture<'r> {
 fn upload<'r>(req: &'r Request, data: Data) -> HandlerFuture<'r> {
     Box::pin(async move {
         if !req.content_type().map_or(false, |ct| ct.is_plain()) {
-            println!("    => Content-Type of upload must be text/plain. Ignoring.");
+            info!("Content-Type of upload must be text/plain. Ignoring.");
             return Outcome::failure(Status::BadRequest);
         }
 
-        let file = File::create(env::temp_dir().join("upload.txt")).await;
-        if let Ok(file) = file {
-            if let Ok(n) = data.open(2.mebibytes()).stream_to(file).await {
-                return Outcome::from(req, format!("OK: {} bytes uploaded.", n));
-            }
+        match File::create(env::temp_dir().join("upload.txt")).await {
+            Ok(file) => {
+                if let Ok(n) = data.open(2.mebibytes()).stream_to(file).await {
+                    return Outcome::from(req, format!("OK: {} bytes uploaded.", n));
+                }
 
-            println!("    => Failed copying.");
-            Outcome::failure(Status::InternalServerError)
-        } else {
-            println!("    => Couldn't open file: {:?}", file.unwrap_err());
-            Outcome::failure(Status::InternalServerError)
+                info!("Failed copying.");
+                Outcome::failure(Status::InternalServerError)
+            }
+            Err(error) => {
+                info!("Couldn't open file, {:?}", error);
+                Outcome::failure(Status::InternalServerError)
+            }
         }
     })
 }

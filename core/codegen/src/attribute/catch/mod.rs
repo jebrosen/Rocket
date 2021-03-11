@@ -18,6 +18,7 @@ pub fn _catch(
     // Gather everything we'll need to generate the catcher.
     let user_catcher_fn = &catch.function;
     let user_catcher_fn_name = &catch.function.sig.ident;
+    let generated_span_name = user_catcher_fn_name.to_string();
     let vis = &catch.function.vis;
     let status_code = Optional(catch.status.map(|s| s.code));
 
@@ -68,13 +69,18 @@ pub fn _catch(
                     #__status: #Status,
                     #__req: &'_b #Request<'_>
                 ) -> #ErrorHandlerFuture<'_b> {
+                    use #_log::Instrument as _;
                     #_Box::pin(async move {
                         let __response = #catcher_response;
                         #Response::build()
                             .status(#__status)
                             .merge(__response)
                             .ok()
-                    })
+                    }.instrument(#_log::info_span!(
+                        #generated_span_name,
+                        status = %#__status,
+                        "Catcher: {}", #generated_span_name
+                    )))
                 }
 
                 #StaticCatcherInfo {

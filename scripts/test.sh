@@ -86,6 +86,7 @@ function test_core() {
   FEATURES=(
     secrets
     tls
+    log
   )
 
   pushd "${CORE_LIB_ROOT}" > /dev/null 2>&1

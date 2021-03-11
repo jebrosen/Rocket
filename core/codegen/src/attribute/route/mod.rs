@@ -88,8 +88,8 @@ fn query_decls(route: &Route) -> Option<TokenStream> {
         )*
 
         if !_e.is_empty() {
-            #_log::warn_("query string failed to match declared route");
-            for _err in _e { #_log::warn_(_err); }
+            #_log::warn!("query string failed to match declared route");
+            for _err in _e { #_log::warn!("{}", _err); }
             return #Outcome::Forward(#__data);
         }
 
@@ -117,10 +117,10 @@ fn param_guard_decl(guard: &Guard) -> TokenStream {
     );
 
     // Returned when a dynamic parameter fails to parse.
-    let parse_error = quote!({
-        #_log::warn_(&format!("Failed to parse '{}': {:?}", #name, __error));
+    let parse_error = quote_spanned! { ty.span() => {
+        #_log::warn!(parameter = #name, error = ?__error, "Failed to parse dynamic parameter");
         #Outcome::Forward(#__data)
-    });
+    } };
 
     // All dynamic parameters should be found if this function is being called;
     // that's the point of statically checking the URI parameters.
@@ -132,8 +132,8 @@ fn param_guard_decl(guard: &Guard) -> TokenStream {
                     #_Err(__error) => return #parse_error,
                 },
                 #_None => {
-                    #_log::error("Internal invariant: dynamic parameter not found.");
-                    #_log::error("Please report this error to the Rocket issue tracker.");
+                    #_log::error!("Internal invariant: dynamic parameter not found.");
+                    #_log::error!("Please report this error to the Rocket issue tracker.");
                     return #Outcome::Forward(#__data);
                 }
             }
@@ -239,6 +239,7 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
     let handler_fn_name = &handler_fn.sig.ident;
     let internal_uri_macro = internal_uri_macro_decl(&route);
     let responder_outcome = responder_outcome_expr(&route);
+    let generated_span_name = handler_fn_name.to_string();
 
     let method = route.attr.method;
     let path = route.attr.uri.to_string();
@@ -261,6 +262,7 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                     #__req: &'_b #Request,
                     #__data: #Data
                 ) -> #HandlerFuture<'_b> {
+                    use #_log::Instrument as _;
                     #_Box::pin(async move {
                         #(#request_guards)*
                         #(#param_guards)*
@@ -268,7 +270,12 @@ fn codegen_route(route: Route) -> Result<TokenStream> {
                         #data_guard
 
                         #responder_outcome
-                    })
+                    }.instrument(#_log::info_span!(
+                        #generated_span_name,
+                        method = %#method,
+                        path = #path,
+                        "Route: {}", #generated_span_name
+                    )))
                 }
 
                 #StaticRouteInfo {

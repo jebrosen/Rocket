@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hyper::server::accept::Accept;
 
-use log::{debug, error};
+use tracing::{debug, error};
 
 use tokio::time::Sleep;
 use tokio::io::{AsyncRead, AsyncWrite};

@@ -170,43 +170,48 @@ impl Drop for Error {
             return
         }
 
-        match self.kind() {
-            ErrorKind::Bind(ref e) => {
-                error!("Rocket failed to bind network socket to given address/port.");
-                info_!("{}", e);
+        match *self.kind() {
+            ErrorKind::Bind(ref error) => {
+                error_span!("bind_error", "Rocket failed to bind network socket to given address/port.").in_scope(|| {
+                    info!(%error);
+                });
                 panic!("aborting due to socket bind error");
             }
-            ErrorKind::Io(ref e) => {
-                error!("Rocket failed to launch due to an I/O error.");
-                info_!("{}", e);
+            ErrorKind::Io(ref error) => {
+                error_span!("io_error", "Rocket failed to launch due to an I/O error.").in_scope(|| {
+                    info!(%error);
+                });
                 panic!("aborting due to i/o error");
             }
             ErrorKind::Collision(ref collisions) => {
-                error!("Rocket failed to launch due to the following routing collisions:");
-                for &(ref a, ref b) in collisions {
-                    info_!("{} {} {}", a, Paint::red("collides with").italic(), b)
-                }
+                error_span!("collisions", "Rocket failed to launch due to the following routing collisions:").in_scope(|| {
+                    for &(ref a, ref b) in collisions {
+                        info!("{} {} {}", a, Paint::red("collides with").italic(), b);
+                    }
 
-                info_!("Note: Collisions can usually be resolved by ranking routes.");
+                    info!("Note: Collisions can usually be resolved by ranking routes.");
+                });
                 panic!("route collisions detected");
             }
             ErrorKind::FailedFairings(ref failures) => {
-                error!("Rocket failed to launch due to failing fairings:");
-                for fairing in failures {
-                    info_!("{}", fairing.name);
-                }
-
+                error_span!("fairing_error", "Rocket failed to launch due to failing fairings:").in_scope(|| {
+                    for fairing in failures {
+                        info!("{}", fairing.name);
+                    }
+                });
                 panic!("aborting due to launch fairing failure");
             }
-            ErrorKind::Runtime(ref err) => {
-                error!("An error occured in the runtime:");
-                info_!("{}", err);
+            ErrorKind::Runtime(ref error) => {
+                error_span!("runtime_error", "An error occured in the runtime:").in_scope(|| {
+                    info!(%error);
+                });
                 panic!("aborting due to runtime failure");
             }
-            ErrorKind::InsecureSecretKey(profile) => {
-                error!("secrets enabled in non-debug without `secret_key`");
-                info_!("selected profile: {}", Paint::white(profile));
-                info_!("disable `secrets` feature or configure a `secret_key`");
+            ErrorKind::InsecureSecretKey(ref profile) => {
+                error_span!("insecure_secret_key", "secrets enabled in non-debug without `secret_key`").in_scope(|| {
+                    info!("selected profile: {}", Paint::white(profile));
+                    info!("disable `secrets` feature or configure a `secret_key`");
+                });
                 panic!("aborting due to insecure configuration")
             }
         }

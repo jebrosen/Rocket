@@ -70,7 +70,7 @@ define_exported_paths! {
     _request => rocket::request,
     _response => rocket::response,
     _handler => rocket::handler,
-    _log => rocket::logger,
+    _log => rocket::trace,
     _form => rocket::form::prelude,
     _http => rocket::http,
     _uri => rocket::http::uri,

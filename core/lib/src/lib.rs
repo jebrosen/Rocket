@@ -100,7 +100,7 @@
 pub use rocket_codegen::*;
 pub use async_trait::*;
 
-#[macro_use] extern crate log;
+#[macro_use] extern crate tracing;
 
 /// These are public dependencies! Update docs if these are changed, especially
 /// figment's version number in docs.
@@ -110,8 +110,6 @@ pub use futures;
 pub use tokio;
 pub use figment;
 
-#[doc(hidden)]
-#[macro_use] pub mod logger;
 #[macro_use] pub mod outcome;
 #[macro_use] pub mod data;
 pub mod local;
@@ -123,6 +121,7 @@ pub mod handler;
 pub mod fairing;
 pub mod error;
 pub mod catcher;
+pub mod trace;
 
 // Reexport of HTTP everything.
 pub mod http {
@@ -147,7 +146,6 @@ mod ext;
 mod state;
 mod cookies;
 
-#[doc(hidden)] pub use log::{info, warn, error, debug};
 #[doc(inline)] pub use crate::response::Response;
 #[doc(hidden)] pub use crate::codegen::{StaticRouteInfo, StaticCatcherInfo};
 #[doc(inline)] pub use crate::data::Data;

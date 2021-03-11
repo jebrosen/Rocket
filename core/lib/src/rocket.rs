@@ -6,12 +6,11 @@ use figment::Figment;
 use tokio::sync::mpsc;
 use futures::future::FutureExt;
 
-use crate::logger;
+use crate::trace::{self, PaintExt, prelude::*};
 use crate::config::Config;
 use crate::catcher::Catcher;
 use crate::router::{Router, Route};
 use crate::fairing::{Fairing, Fairings};
-use crate::logger::PaintExt;
 use crate::shutdown::Shutdown;
 use crate::http::uri::Origin;
 use crate::error::{Error, ErrorKind};
@@ -86,7 +85,7 @@ impl Rocket {
     pub fn custom<T: figment::Provider>(provider: T) -> Rocket {
         let config = Config::from(&provider);
         let figment = Figment::from(provider);
-        logger::init(&config);
+        let _ = trace::try_init(&config);
         config.pretty_print(&figment);
 
         let managed_state = <Container![Send + Sync]>::new();
@@ -147,7 +146,7 @@ impl Rocket {
     pub fn reconfigure<T: figment::Provider>(mut self, provider: T) -> Rocket {
         self.config = Config::from(&provider);
         self.figment = Figment::from(provider);
-        logger::init(&self.config);
+        trace::try_init(&self.config);
         self.config.pretty_print(&self.figment);
         self
     }
@@ -204,37 +203,32 @@ impl Rocket {
     /// # };
     /// ```
     pub fn mount<R: Into<Vec<Route>>>(mut self, base: &str, routes: R) -> Self {
-        let base_uri = Origin::parse_owned(base.to_string())
-            .unwrap_or_else(|e| {
-                error!("Invalid mount point URI: {}.", Paint::white(base));
-                panic!("Error: {}", e);
-            });
-
-        if base_uri.query().is_some() {
-            error!("Mount point '{}' contains query string.", base);
-            panic!("Invalid mount point.");
-        }
-
-        info!("{}{} {}{}",
-              Paint::emoji("🛰  "),
-              Paint::magenta("Mounting"),
-              Paint::blue(&base_uri),
-              Paint::magenta(":"));
-
-        for route in routes.into() {
-            let old_route = route.clone();
-            let route = route.map_base(|old| format!("{}{}", base, old))
+        info_span!("mounting", at = %Paint::blue(&base), "{} Mounting", Paint::emoji("🛰  ")).in_scope(|| {
+            let base_uri = Origin::parse_owned(base.to_string())
                 .unwrap_or_else(|e| {
-                    error_!("Route `{}` has a malformed URI.", old_route);
-                    error_!("{}", e);
-                    panic!("Invalid route URI.");
+                    error!(uri = %Paint::white(base), "Invalid mount point URI");
+                    panic!("Error: {}", e);
                 });
 
-            info_!("{}", route);
-            self.router.add(route);
-        }
+            if base_uri.query().is_some() {
+                error!("Mount point '{}' contains query string.", base);
+                panic!("Invalid mount point.");
+            }
 
-        self
+            for route in routes.into() {
+                let old_route = route.clone();
+                let route = route.map_base(|old| format!("{}{}", base, old))
+                    .unwrap_or_else(|error| {
+                        error!(route = %old_route, %error, "Route has a malformed URI.");
+                        panic!("Invalid route URI.");
+                    });
+
+                info!(%route);
+                self.router.add(route);
+            }
+
+            self
+        })
     }
 
     /// Registers all of the catchers in the supplied vector.
@@ -261,22 +255,22 @@ impl Rocket {
     /// }
     /// ```
     pub fn register(mut self, catchers: Vec<Catcher>) -> Self {
-        info!("{}{}", Paint::emoji("👾 "), Paint::magenta("Catchers:"));
+        info_span!("catchers", "{}{}", Paint::emoji("👾 "), Paint::magenta("Catchers:")).in_scope(|| {
+            for catcher in catchers {
+                info!(%catcher);
 
-        for catcher in catchers {
-            info_!("{}", catcher);
+                let existing = match catcher.code {
+                    Some(code) => self.catchers.insert(code, catcher),
+                    None => self.default_catcher.replace(catcher)
+                };
 
-            let existing = match catcher.code {
-                Some(code) => self.catchers.insert(code, catcher),
-                None => self.default_catcher.replace(catcher)
-            };
-
-            if let Some(existing) = existing {
-                warn_!("Replacing existing '{}' catcher.", existing);
+                if let Some(existing) = existing {
+                    warn!("Replacing existing '{}' catcher.", existing);
+                }
             }
-        }
 
-        self
+            self
+        })
     }
 
     /// Add `state` to the state managed by this instance of Rocket.
@@ -349,7 +343,7 @@ impl Rocket {
             let mut fairings = std::mem::replace(&mut self.fairings, Fairings::new());
             let rocket = fairings.attach(fairing, self).await;
             (rocket, fairings)
-        };
+        }.in_current_span();
 
         // TODO: Reuse a single thread to run all attach fairings.
         let (rocket, mut fairings) = match tokio::runtime::Handle::try_current() {
@@ -542,13 +536,14 @@ impl Rocket {
                 self.config.secret_key = crate::config::SecretKey::generate()
                     .unwrap_or(crate::config::SecretKey::zero());
 
-                warn!("secrets enabled without a stable `secret_key`");
-                info_!("disable `secrets` feature or configure a `secret_key`");
-                info_!("this becomes an {} in non-debug profiles", Paint::red("error"));
+                warn_span!("unconfigured_secret_key", "secrets enabled without a stable `secret_key`").in_scope(|| {
+                    info!("disable `secrets` feature or configure a `secret_key`");
+                    info!("this becomes an {} in non-debug profiles", Paint::red("error"));
 
-                if !self.config.secret_key.is_zero() {
-                    warn_!("a random key has been generated for this launch");
-                }
+                    if !self.config.secret_key.is_zero() {
+                        warn!("a random key has been generated for this launch");
+                    }
+                });
             }
         };
 
@@ -624,10 +619,9 @@ impl Rocket {
                 shutdown_handle.shutdown();
                 server.await
             }
-            Either::Left((Err(err), server)) => {
+            Either::Left((Err(error), server)) => {
                 // Error setting up ctrl-c signal. Let the user know.
-                warn!("Failed to enable `ctrl-c` graceful signal shutdown.");
-                info_!("Error: {}", err);
+                warn!(%error, "Failed to enable `ctrl-c` graceful signal shutdown.");
                 server.await
             }
             // Server shut down before Ctrl-C; return the result.

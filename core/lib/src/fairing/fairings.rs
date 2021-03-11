@@ -1,6 +1,6 @@
 use crate::{Rocket, Request, Response, Data};
 use crate::fairing::{Fairing, Info, Kind};
-use crate::logger::PaintExt;
+use crate::trace::PaintExt;
 
 use yansi::Paint;
 
@@ -103,15 +103,16 @@ impl Fairings {
 
             let num = names.len();
             let joined = names.join(", ");
-            info_!("{} {}: {}", Paint::default(num).bold(), prefix, Paint::default(joined).bold());
+            info!("{} {}: {}", Paint::default(num).bold(), prefix, Paint::default(&joined).bold());
         }
 
         if !self.all_fairings.is_empty() {
-            info!("{}{}:", Paint::emoji("📡 "), Paint::magenta("Fairings"));
-            pretty_print(self, "attach", Kind::Attach);
-            pretty_print(self, "launch", Kind::Launch);
-            pretty_print(self, "request", Kind::Request);
-            pretty_print(self, "response", Kind::Response);
+            info_span!("fairings", "{}{}:", Paint::emoji("📡 "), Paint::magenta("Fairings")).in_scope(|| {
+                pretty_print(self, "attach", Kind::Attach);
+                pretty_print(self, "launch", Kind::Launch);
+                pretty_print(self, "request", Kind::Request);
+                pretty_print(self, "response", Kind::Response);
+            });
         }
     }
 }

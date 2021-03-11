@@ -177,7 +177,7 @@ impl<'r, T: Send + Sync + 'static> FromRequest<'r> for State<'r, T> {
         match req.state.managed.try_get::<T>() {
             Some(state) => Outcome::Success(State(state)),
             None => {
-                error_!("Attempted to retrieve unmanaged state!");
+                error!("Attempted to retrieve unmanaged state!");
                 Outcome::Failure((Status::InternalServerError, ()))
             }
         }

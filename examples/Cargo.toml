@@ -32,4 +32,6 @@ members = [
   "tls",
   "fairings",
   "hello_2018",
+  "trace_env_logger",
+  "trace_subscriber",
 ]

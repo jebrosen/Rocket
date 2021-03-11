@@ -1,9 +1,12 @@
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use futures::stream::StreamExt;
-use futures::future::{FutureExt, Future};
+use futures::future::FutureExt;
 use tokio::sync::oneshot;
+use tracing::instrument::{Instrument, Instrumented};
 use yansi::Paint;
 
 use crate::{Rocket, Request, Data, handler};
@@ -11,7 +14,7 @@ use crate::form::Form;
 use crate::response::{Response, Body};
 use crate::outcome::Outcome;
 use crate::error::{Error, ErrorKind};
-use crate::logger::PaintExt;
+use crate::trace::{self, PaintExt};
 use crate::ext::AsyncReadExt;
 
 use crate::http::{Method, Status, Header, hyper};
@@ -28,20 +31,22 @@ async fn handle<Fut, T, F>(name: Option<&str>, run: F) -> Option<T>
 
     macro_rules! panic_info {
         ($name:expr, $e:expr) => {{
-            match $name {
-                Some(name) => error_!("Handler {} panicked.", Paint::white(name)),
-                None => error_!("A handler panicked.")
+            let error_span = match $name {
+                Some(name) => error_span!("handler_panic", "Handler {} panicked.", Paint::white(name)),
+                None => error_span!("handler_panic", "A handler panicked.")
             };
 
-            info_!("This is an application bug.");
-            info_!("A panic in Rust must be treated as an exceptional event.");
-            info_!("Panicking is not a suitable error handling mechanism.");
-            info_!("Unwinding, the result of a panic, is an expensive operation.");
-            info_!("Panics will severely degrade application performance.");
-            info_!("Instead of panicking, return `Option` and/or `Result`.");
-            info_!("Values of either type can be returned directly from handlers.");
-            warn_!("A panic is treated as an internal server error.");
-            $e
+            error_span.in_scope(|| {
+                info!("This is an application bug.");
+                info!("A panic in Rust must be treated as an exceptional event.");
+                info!("Panicking is not a suitable error handling mechanism.");
+                info!("Unwinding, the result of a panic, is an expensive operation.");
+                info!("Panics will severely degrade application performance.");
+                info!("Instead of panicking, return `Option` and/or `Result`.");
+                info!("Values of either type can be returned directly from handlers.");
+                warn!("A panic is treated as an internal server error.");
+                $e
+            });
         }}
     }
 
@@ -83,7 +88,7 @@ async fn hyper_service_fn(
         let mut req = match req_res {
             Ok(req) => req,
             Err(e) => {
-                error!("Bad incoming request: {}", e);
+                error!(error = %e, "Bad incoming request");
                 // TODO: We don't have a request to pass in, so we just
                 // fabricate one. This is weird. We should let the user know
                 // that we failed to parse a request (by invoking some special
@@ -94,14 +99,20 @@ async fn hyper_service_fn(
             }
         };
 
-        // Retrieve the data from the hyper body.
-        let mut data = Data::from(h_body);
+        let span = info_span!("request", "{}", req);
+        async {
+            // Retrieve the data from the hyper body.
+            let mut data = Data::from(h_body);
 
-        // Dispatch the request to get a response, then write that response out.
-        let token = rocket.preprocess_request(&mut req, &mut data).await;
-        let r = rocket.dispatch(token, &mut req, data).await;
-        rocket.send_response(r, tx).await;
-    });
+            // Dispatch the request to get a response, then write that response out.
+            let token = rocket.preprocess_request(&mut req, &mut data).await;
+            let r = rocket.dispatch(token, &mut req, data).await;
+            rocket.send_response(r, tx).await;
+        }
+            .instrument(span)
+            .await
+
+    }.in_current_span());
 
     // Receive the response written to `tx` by the task above.
     rx.await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
@@ -116,8 +127,8 @@ impl Rocket {
         tx: oneshot::Sender<hyper::Response<hyper::Body>>,
     ) {
         match self.make_response(response, tx).await {
-            Ok(()) => info_!("{}", Paint::green("Response succeeded.")),
-            Err(e) => error_!("Failed to write response: {:?}.", e),
+            Ok(()) => info!("{}", Paint::green("Response succeeded.")),
+            Err(error) => error!(%error, "Failed to write response"),
         }
     }
 
@@ -217,8 +228,6 @@ impl Rocket {
         request: &'r Request<'s>,
         data: Data
     ) -> Response<'r> {
-        info!("{}:", request);
-
         // Remember if the request is `HEAD` for later body stripping.
         let was_head_request = request.method() == Method::Head;
 
@@ -250,7 +259,7 @@ impl Rocket {
         let mut response = match self.route(request, data).await {
             Outcome::Success(response) => response,
             Outcome::Forward(data) if request.method() == Method::Head => {
-                info_!("Autohandling {} request.", Paint::default("HEAD").bold());
+                info!("Autohandling {} request.", Paint::default("HEAD").bold());
 
                 // Dispatch the request again with Method `GET`.
                 request._set_method(Method::Get);
@@ -289,7 +298,7 @@ impl Rocket {
         let matches = self.router.route(request);
         for route in matches {
             // Retrieve and set the requests parameters.
-            info_!("Matched: {}", route);
+            info!(matched = %route);
             request.set_route(route);
 
             let name = route.name.as_deref();
@@ -299,14 +308,14 @@ impl Rocket {
             // Check if the request processing completed (Some) or if the
             // request needs to be forwarded. If it does, continue the loop
             // (None) to try again.
-            info_!("{} {}", Paint::default("Outcome:").bold(), outcome);
+            info!(%outcome);
             match outcome {
                 o@Outcome::Success(_) | o@Outcome::Failure(_) => return o,
                 Outcome::Forward(unused_data) => data = unused_data,
             }
         }
 
-        error_!("No matching routes for {}.", request);
+        error!("No matching routes for {}.", request);
         Outcome::Forward(data)
     }
 
@@ -335,14 +344,14 @@ impl Rocket {
             .or_else(|| self.default_catcher.as_ref());
 
         if let Some(catcher) = catcher {
-            warn_!("Responding with registered {} catcher.", catcher);
+            warn!("Responding with registered {} catcher.", catcher);
             let name = catcher.name.as_deref();
             handle(name, || catcher.handler.handle(status, req)).await
                 .map(|result| result.map_err(Some))
                 .unwrap_or_else(|| Err(None))
         } else {
             let code = Paint::blue(status.code).bold();
-            warn_!("No {} catcher registered. Using Rocket default.", code);
+            warn!("No {} catcher registered. Using Rocket default.", code);
             Ok(crate::catcher::default(status, req))
         }
     }
@@ -351,28 +360,30 @@ impl Rocket {
     //
     // On catcher failure, the 500 error catcher is attempted. If _that_ fails,
     // the (infallible) default 500 error cather is used.
-    pub(crate) async fn handle_error<'s, 'r: 's>(
+    pub(crate) fn handle_error<'s, 'r: 's>(
         &'s self,
         mut status: Status,
         req: &'r Request<'s>
-    ) -> Response<'r> {
-        // Dispatch to the `status` catcher.
-        if let Ok(r) = self.invoke_catcher(status, req).await {
-            return r;
-        }
-
-        // If it fails and it's not a 500, try the 500 catcher.
-        if status != Status::InternalServerError {
-            error_!("Catcher failed. Attemping 500 error catcher.");
-            status = Status::InternalServerError;
+    ) -> impl Future<Output = Response<'r>> + Send + 's {
+        async move {
+            // Dispatch to the `status` catcher.
             if let Ok(r) = self.invoke_catcher(status, req).await {
                 return r;
             }
-        }
 
-        // If it failed again or if it was already a 500, use Rocket's default.
-        error_!("{} catcher failed. Using Rocket default 500.", status.code);
-        crate::catcher::default(Status::InternalServerError, req)
+            // If it fails and it's not a 500, try the 500 catcher.
+            if status != Status::InternalServerError {
+                error!("Catcher failed. Attemping 500 error catcher.");
+                status = Status::InternalServerError;
+                if let Ok(r) = self.invoke_catcher(status, req).await {
+                    return r;
+                }
+            }
+
+            // If it failed again or if it was already a 500, use Rocket's default.
+            error!("{} catcher failed. Using Rocket default 500.", status.code);
+            crate::catcher::default(Status::InternalServerError, req)
+        }.instrument(warn_span!("handle_error", "Responding with {} catcher.", Paint::red(&status)))
     }
 
     // TODO.async: Solidify the Listener APIs and make this function public
@@ -396,7 +407,8 @@ impl Rocket {
         self.fairings.pretty_print_counts();
         self.fairings.handle_launch(&self);
 
-        launch_info!("{}{} {}{}",
+        trace::info!(target: "launch",
+                     "{}{} {}{}",
                      Paint::emoji("🚀 "),
                      Paint::default("Rocket has launched from").bold(),
                      Paint::default(proto).bold().underline(),
@@ -418,19 +430,51 @@ impl Rocket {
             let rocket = rocket.clone();
             let remote = conn.remote_addr().unwrap_or_else(|| ([0, 0, 0, 0], 0).into());
             async move {
-                Ok::<_, std::convert::Infallible>(hyper::service_fn(move |req| {
+                let service = hyper::service_fn(move |req| {
                     hyper_service_fn(rocket.clone(), remote, req)
-                }))
+                });
+                Ok::<_, std::convert::Infallible>(service)
             }
         });
 
-        // NOTE: `hyper` uses `tokio::spawn()` as the default executor.
+        #[derive(Clone)]
+        struct InCurrentSpanExecutor;
+
+        impl<Fut> hyper::Executor<Fut> for InCurrentSpanExecutor
+            where Fut: Future + Send + 'static, Fut::Output: Send
+        {
+            fn execute(&self, fut: Fut) {
+                tokio::spawn(fut.in_current_span());
+            }
+        }
+
         hyper::Server::builder(Incoming::from_listener(listener))
+            .executor(InCurrentSpanExecutor)
             .http1_keepalive(http1_keepalive)
             .http2_keep_alive_interval(http2_keep_alive)
             .serve(service)
             .with_graceful_shutdown(async move { shutdown_receiver.recv().await; })
             .await
             .map_err(|e| Error::new(ErrorKind::Runtime(Box::new(e))))
+    }
+}
+
+struct InstrumentedService<S> {
+    span: tracing::Span,
+    service: S
+}
+
+impl<S: hyper::Service<R>, R> hyper::Service<R> for InstrumentedService<S> {
+    type Response = S::Response;
+    type Future = Instrumented<S::Future>;
+    type Error = S::Error;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let _e = self.span.enter();
+        self.service.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        self.service.call(request).instrument(self.span.clone())
     }
 }
